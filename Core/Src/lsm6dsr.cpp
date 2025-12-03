@@ -12,8 +12,11 @@ LSM6DSR::LSM6DSR(SPI_HandleTypeDef *hspi, GPIO_TypeDef *cs_port, uint16_t cs_pin
     hspi(hspi),
     cs_port(cs_port),
     cs_pin(cs_pin),
+    int_pin(GPIO_PIN_All),
     current_accel_scale(Scale::SCALE_2G_250DPS),
-    current_gyro_scale(Scale::SCALE_8G_2000DPS)     // 4000DPS default, but set to 2000 in init 
+    current_gyro_scale(Scale::SCALE_8G_2000DPS),    // 4000DPS default, but set to 2000 in init 
+    new_data_avail(false),
+    last_read_time(0)
 {
     
 }
@@ -50,12 +53,6 @@ LSM6DSR::Status LSM6DSR::init() {
 }
 
 
-LSM6DSR::Status set_interrupt_pin(uint8_t int_id, GPIO_TypeDef *port, uint16_t pin) {
-    HAL_StatusTypeDef ret;
-
-}
-
-
 /**
  * @brief Set data rate
  * 
@@ -64,7 +61,6 @@ LSM6DSR::Status set_interrupt_pin(uint8_t int_id, GPIO_TypeDef *port, uint16_t p
  * @return LSM6DSR::Status 
  */
 LSM6DSR::Status LSM6DSR::set_data_rate(LSM6DSR::Dev dev, LSM6DSR::DataRate data_rate) {
-    HAL_StatusTypeDef ret;
     uint8_t data = static_cast<uint8_t>(data_rate) << 4;
     if (dev == Dev::ACCEL) {
         CHECK_ERR_HAL(write_reg(Reg::CTRL1_XL, data, 0xF0, true));
@@ -83,7 +79,6 @@ LSM6DSR::Status LSM6DSR::set_data_rate(LSM6DSR::Dev dev, LSM6DSR::DataRate data_
  * @return LSM6DSR::Status 
  */
 LSM6DSR::Status LSM6DSR::set_scale(LSM6DSR::Dev dev, LSM6DSR::Scale scale) {
-    HAL_StatusTypeDef ret;
     uint8_t data = static_cast<uint8_t>(scale) << 2;
     if (dev == Dev::ACCEL) {
         CHECK_ERR_HAL(write_reg(Reg::CTRL1_XL, data, BIT(2) | BIT(3), true));
@@ -101,20 +96,64 @@ LSM6DSR::Status LSM6DSR::set_scale(LSM6DSR::Dev dev, LSM6DSR::Scale scale) {
 /**
  * @brief Read sensor data
  * 
- * @param data 
+ * @param data      output {temp deg C, gyro rad/s[3], accel m/s[3]}
+ * @param blocking  false will only read when new data available
  * @return LSM6DSR::Status 
  */
 LSM6DSR::Status LSM6DSR::read(double data[7], bool blocking) {
-    HAL_StatusTypeDef ret;
-    if (blocking) {
+    // blocking / new data / timeout
+    if (blocking || new_data_avail || last_read_time - HAL_GetTick() >= 30) {
+        last_read_time = HAL_GetTick();
         uint8_t raw[14];
         CHECK_ERR_HAL(read_regs(Reg::OUT_TEMP_L, raw, 14));
         parse_data(raw, data);
-        return Status::OK;
-    } else {
+        new_data_avail = false;
         return Status::OK;
     }
+    // nothing to do when non-blocking and flag not set
+    HAL_Delay(1);
+    return Status::FREE;
 }
+
+
+/**
+ * @brief Setup interrupt
+ * 
+ * @param sync  sync data source in imu 
+ * @param pin   interrupt EXTI pin for imu INT1
+ * @return LSM6DSR::Status 
+ */
+LSM6DSR::Status LSM6DSR::set_read_trigger_interrupt(Dev sync, uint16_t pin) {
+    uint8_t data = 0;
+    if (sync == Dev::ACCEL) {
+        data = BIT(0);
+    }else {
+        data = BIT(1);
+    }
+    CHECK_ERR_HAL(write_reg(Reg::INT1_CTRL, data, 0, true));
+    int_pin = pin;
+    // force read to clear INT status of imu
+    double garbage[7];
+    read(garbage);
+    return Status::OK;
+}
+
+
+/**
+ * @brief Handler gpio EXTI interrupt
+ * 
+ * @param pin interrupted pin
+ * @return LSM6DSR::Status 
+ */
+LSM6DSR::Status LSM6DSR::gpio_interrupt_handler(uint16_t pin) {
+    if (pin == int_pin) {
+        new_data_avail = true;
+        return Status::OK;
+    }
+    return Status::FREE;
+}
+
+
 
 
 /**
@@ -129,16 +168,16 @@ LSM6DSR::Status LSM6DSR::read(double data[7], bool blocking) {
 HAL_StatusTypeDef LSM6DSR::write_reg(Reg reg, uint8_t data, uint8_t mask, bool check) {
     HAL_StatusTypeDef ret;
     // Prepare buffer data
-    uint8_t tx_buffer[2] = {static_cast<uint8_t>(reg), data};
+    uint8_t tx_data[2] = {static_cast<uint8_t>(reg), data};
     // Mask available
     if (mask != 0) {
-        read_reg(reg, tx_buffer + 1);
-        tx_buffer[1] &= ~mask;
-        tx_buffer[1] |= (data & mask);
+        read_reg(reg, tx_data + 1);
+        tx_data[1] &= ~mask;
+        tx_data[1] |= (data & mask);
     }
     // Transmit addr and data
     HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_RESET);
-    ret = HAL_SPI_Transmit(hspi, tx_buffer, 2, 10);
+    ret = HAL_SPI_Transmit(hspi, tx_data, 2, 10);
     HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_SET);
     // Transmit failed
     if (ret != HAL_OK) {
@@ -148,7 +187,7 @@ HAL_StatusTypeDef LSM6DSR::write_reg(Reg reg, uint8_t data, uint8_t mask, bool c
     if (check) { 
         uint8_t read_buffer = 0;
         read_reg(reg, &read_buffer);
-        if (read_buffer != tx_buffer[1]) {
+        if (read_buffer != tx_data[1]) {
             return HAL_ERROR;
         }
     }
@@ -179,10 +218,10 @@ HAL_StatusTypeDef LSM6DSR::read_reg(Reg reg, uint8_t data[1]) {
 HAL_StatusTypeDef LSM6DSR::read_regs(Reg reg, uint8_t *data, size_t size) {
     HAL_StatusTypeDef ret;
     HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_RESET);
-    // Prepare buffer data
-    uint8_t tx_buffer = static_cast<uint8_t>(reg) | 0x80; // Set read flag
+    // Prepare tx data
+    uint8_t tx_data = static_cast<uint8_t>(reg) | 0x80; // Set read flag
     // Transmit addr
-    ret = HAL_SPI_Transmit(hspi, &tx_buffer, 1, 10);
+    ret = HAL_SPI_Transmit(hspi, &tx_data, 1, 10);
     // Transmit failed
     if (ret != HAL_OK) {
         HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_SET);

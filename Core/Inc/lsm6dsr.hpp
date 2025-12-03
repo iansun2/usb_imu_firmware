@@ -52,13 +52,10 @@ public:
 
     Status read(double data[7], bool blocking = true);
 
-    Status set_interrupt_pin(uint8_t int_id, GPIO_TypeDef *port, uint16_t pin);
+    Status set_read_trigger_interrupt(Dev sync, uint16_t pin);
 
-    Status loop_handler();
-
-    Status receive_interrupt_handler();
-
-    Status gpio_interrupt_handler();
+    Status gpio_interrupt_handler(uint16_t pin);
+    
 
     enum class Reg{
         PIN_CTRL      = 0x02,
@@ -101,8 +98,10 @@ public:
 private:
     SPI_HandleTypeDef *hspi;
     GPIO_TypeDef *cs_port;
-    uint16_t cs_pin;
+    uint16_t cs_pin, int_pin;
     Scale current_accel_scale, current_gyro_scale;
+    volatile bool new_data_avail; 
+    uint32_t last_read_time;
 
     HAL_StatusTypeDef write_reg(Reg reg, uint8_t data, uint8_t mask, bool check);
     HAL_StatusTypeDef read_reg(Reg reg, uint8_t data[1]);

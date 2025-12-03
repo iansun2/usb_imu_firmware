@@ -119,6 +119,7 @@ USB_DEVICE/Target/usbd_conf.c
 
 CXX_SOURCES = \
 Core/Src/cpp_entry.cpp \
+Core/Src/interrupt.cpp \
 Core/Src/lsm6dsr.cpp \
 build/main.cpp
 
